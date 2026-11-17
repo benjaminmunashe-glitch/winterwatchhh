@@ -58,13 +58,14 @@
           <option value="gemini">Google Gemini</option>
           <option value="groq">Groq</option>
         </select></div>
-      <div><label for="model">Model</label><input id="model"></div>
+      <div><label for="model">Model</label><input id="model" list="modelList"><datalist id="modelList"></datalist></div>
       <div><label for="key">API key</label><input id="key" type="password" autocomplete="off" placeholder="Paste your key"></div>
       <div><label for="priceIn">Price input, $ per 1M tokens</label><input id="priceIn" type="number" step="0.01"></div>
       <div><label for="priceOut">Price output, $ per 1M tokens</label><input id="priceOut" type="number" step="0.01"></div>
     </div>
     <div class="btns">
       <button id="saveKey">Save settings</button>
+      <button id="listModels" class="secondary">List my models</button>
       <button id="forgetKey" class="danger">Forget key</button>
       <span id="keyStatus" class="muted"></span>
     </div>
@@ -126,7 +127,7 @@ const DEFAULTS = {
   openai:    { model: "gpt-4.1-mini",            in: 0.40, out: 1.60 },
   anthropic: { model: "claude-haiku-5-5",        in: 1.00, out: 5.00 },
   gemini:    { model: "gemini-2.5-flash",        in: 0.30, out: 2.50 },
-  groq:      { model: "llama-3.3-70b-versatile", in: 0.59, out: 0.79 },
+  groq:      { model: "openai/gpt-oss-120b",     in: 0.15, out: 0.60 },
 };
 const $ = id => document.getElementById(id);
 
@@ -404,62 +405,50 @@ async function callBrain(provider, model, key, system, user) {
   return { text: j.choices[0].message.content, inT: j.usage.prompt_tokens, outT: j.usage.completion_tokens };
 }
 
+/* ---------- model list from the provider (so retired model names never break the page) ---------- */
+async function listModels(provider, key) {
+  let r, j;
+  if (provider === "anthropic") {
+    r = await fetch("https://api.anthropic.com/v1/models?limit=100", { headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" } });
+    j = await r.json(); if (!r.ok) throw new Error(r.status + " " + (j.error?.message || ""));
+    return j.data.map(m => m.id);
+  }
+  if (provider === "gemini") {
+    r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": key } });
+    j = await r.json(); if (!r.ok) throw new Error(r.status + " " + (j.error?.message || ""));
+    return j.models.filter(m => (m.supportedGenerationMethods || []).includes("generateContent")).map(m => m.name.replace("models/", ""));
+  }
+  const url = provider === "groq" ? "https://api.groq.com/openai/v1/models" : "https://api.openai.com/v1/models";
+  r = await fetch(url, { headers: { authorization: "Bearer " + key } });
+  j = await r.json(); if (!r.ok) throw new Error(r.status + " " + (j.error?.message || ""));
+  return j.data.filter(m => m.active !== false).map(m => m.id);
+}
+// chat models only, best first
+function pickModel(provider, ids) {
+  const chat = ids.filter(id => !/whisper|tts|guard|embed|image|audio|dall|moderation|transcri|realtime|search|compound|orpheus|playai|vision-preview/i.test(id));
+  const prefs = { groq: [/gpt-oss-120b/, /llama-4-maverick/, /llama.*70b/, /qwen/, /gpt-oss/, /llama/],
+                  openai: [/^gpt-.*mini$/, /^gpt-/], anthropic: [/haiku/, /sonnet/], gemini: [/flash$/, /flash/] }[provider] || [];
+  for (const re of prefs) { const hit = chat.filter(id => re.test(id)).sort().reverse()[0]; if (hit) return hit; }
+  return chat[0];
+}
+async function refreshModelList(provider, key) {
+  const ids = await listModels(provider, key);
+  $("modelList").innerHTML = ids.map(id => '<option value="' + esc(id) + '">').join("");
+  return ids;
+}
+$("listModels").addEventListener("click", async () => {
+  syncProviderToKey();
+  const key = $("key").value.trim() || store.get("ww_key");
+  if (!key) { $("keyStatus").textContent = "Paste a key first."; return; }
+  try { const ids = await refreshModelList($("provider").value, key);
+        $("keyStatus").textContent = ids.length + " models available. Click the Model box to choose one."; }
+  catch (e) { $("keyStatus").textContent = "Could not list models: " + e.message; }
+});
+
 async function ask() {
   const q = $("question").value.trim(); if (!q) return;
   const key = $("key").value.trim() || store.get("ww_key") || "";
   if (!key) { $("answer").textContent = "Add your API key in Settings first."; return; }
   syncProviderToKey();
   const provider = $("provider").value, model = $("model").value.trim();
-  $("ask").disabled = true; $("answer").textContent = "Fetching forecast, depots, plan and history…"; $("cost").textContent = "";
-  try {
-    let t, h;
-    try { [t, h] = await Promise.all([buildTonight(), buildHistory()]); }
-    catch (e) { throw new Error("[step 1: fetching data] " + e.message); }
-    const user = `QUESTION: ${q}
-
-=== TONIGHT: per-route lines (computed in code at ${t.fetchedAt.toLocaleString("en-IE")}, forecast next 24 h) ===
-${t.lines.join("\n")}
-
-=== DEPOTS [tonight.csv] ===
-${t.depotLines.join("\n")}
-
-=== FLAGS (computed in code) ===
-${t.flags.map(f => "- " + f.t).join("\n") || "none"}
-
-=== FIVE WINTERS SUMMARY [history.csv], computed in code; ${h.totals} ===
-${h.lines.join("\n")}
-Depots: ${h.dl.join(" | ")}
-
-=== WINTER SERVICE PLAN [plan.md] ===
-${t.plan}`;
-    $("answer").textContent = "Asking " + provider + " (" + model + ")…";
-    let out;
-    try { out = await callBrain(provider, model, key, SYSTEM, user); }
-    catch (e) {
-      const m = e.message;
-      const hint = /failed to fetch|networkerror|load failed/i.test(m) ? " (the browser could not reach the provider: check your internet, an ad-blocker, or that the provider matches your key)"
-        : /401|403|invalid|incorrect api key|unauthori|authentication|permission/i.test(m) ? " (key rejected: check it matches the selected provider and has no extra spaces)"
-        : /quota|billing|credit|429|rate/i.test(m) ? " (no credit on the account or rate limit hit)"
-        : /model/i.test(m) ? " (try a different model name from your provider's model list)" : "";
-      throw new Error("[step 2: calling " + provider + " / " + model + "] " + m + hint);
-    }
-    $("answer").textContent = out.text;
-    const pin = +$("priceIn").value || 0, pout = +$("priceOut").value || 0;
-    const usd = out.inT / 1e6 * pin + out.outT / 1e6 * pout;
-    $("cost").textContent = `Cost of this question: ${(usd * 100).toFixed(3)} cents (${out.inT} input tokens × $${pin}/1M + ${out.outT} output tokens × $${pout}/1M, ${provider} ${model}; token counts as reported by the provider).`;
-  } catch (e) {
-    $("answer").textContent = "Error: " + e.message;
-  } finally { $("ask").disabled = false; }
-}
-
-$("ask").addEventListener("click", ask);
-document.querySelectorAll(".bench").forEach(b => b.addEventListener("click", () => { $("question").value = b.dataset.q; ask(); }));
-$("refresh").addEventListener("click", async () => {
-  try { await Promise.all([buildTonight(), buildHistory()]); } catch (e) { $("fetchedAt").textContent = "Error: " + e.message; }
-});
-loadSettings();
-buildTonight().catch(e => $("fetchedAt").textContent = "Error: " + e.message);
-buildHistory().catch(e => $("histCheck").textContent = "Error: " + e.message);
-</script>
-</body>
-</html>
+  $("ask").disabled = true; $("answer").textContent = "Fetching
